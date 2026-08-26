@@ -1,0 +1,37 @@
+{
+  "name": "@otisworks/curriculum-squad",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "A 5-agent pipeline that researches a subject and produces a source-verified curriculum outline and course proposal",
+  "main": "curriculum-squad.js",
+  "bin": {
+    "curriculum-squad": "curriculum-squad.js"
+  },
+  "scripts": {
+    "start": "node curriculum-squad.js",
+    "run": "node curriculum-squad.js"
+  },
+  "keywords": [
+    "ai",
+    "agents",
+    "anthropic",
+    "claude",
+    "curriculum",
+    "syllabus",
+    "course-design",
+    "education",
+    "research",
+    "multi-agent",
+    "llm"
+  ],
+  "author": "otisworks",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/otisworks/curriculum-squad.git"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.39.0",
+    "openai": "^4.77.0"
+  }
+}

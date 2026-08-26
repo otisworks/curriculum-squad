@@ -1,0 +1,7 @@
+node_modules/
+.env
+.env.local
+curriculum-*T*Z/
+output-*T*Z/
+.DS_Store
+*.log
