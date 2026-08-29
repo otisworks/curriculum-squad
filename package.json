@@ -1,6 +1,6 @@
 {
   "name": "@otisworks/curriculum-squad",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "type": "module",
   "description": "A 5-agent pipeline that researches a subject and produces a source-verified curriculum outline and course proposal",
   "main": "curriculum-squad.js",
