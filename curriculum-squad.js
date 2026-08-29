@@ -4,32 +4,216 @@
  * Give it a subject, get back a researched, verified course proposal.
  * No framework BS - just agents, tasks, and results.
  *
- * Supports: Anthropic (default) or OpenAI
+ * Supports: Anthropic, OpenAI, OpenRouter, DeepSeek
  */
 
 import Anthropic from "@anthropic-ai/sdk";
 import OpenAI from "openai";
+import { readFileSync, existsSync, realpathSync } from "fs";
+import { dirname, join } from "path";
+import { fileURLToPath } from "url";
+
+// ============================================
+// ENV FILE LOADING
+// ============================================
+
+/**
+ * Minimal .env reader - deliberately not a dependency.
+ *
+ * Exists so someone can save their API key once in a file instead of running
+ * `export` in every new terminal. That ritual is the single most common reason
+ * a first run fails for someone who doesn't live in a shell.
+ *
+ * Real environment variables always win, so `KEY=... node curriculum-squad.js`
+ * still overrides the file.
+ */
+function parseEnvFile(contents) {
+  const vars = {};
+
+  for (const rawLine of contents.split("\n")) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith("#")) continue;
+
+    // Tolerate "export KEY=value", since people paste that out of instructions
+    const withoutExport = line.startsWith("export ") ? line.slice(7).trim() : line;
+
+    const eq = withoutExport.indexOf("=");
+    if (eq === -1) continue;
+
+    const key = withoutExport.slice(0, eq).trim();
+    if (!key) continue;
+
+    let value = withoutExport.slice(eq + 1).trim();
+
+    // Strip matching surrounding quotes; leave inner content alone
+    const quoted =
+      (value.startsWith('"') && value.endsWith('"') && value.length > 1) ||
+      (value.startsWith("'") && value.endsWith("'") && value.length > 1);
+    if (quoted) {
+      value = value.slice(1, -1);
+    } else {
+      // Only strip trailing comments on unquoted values - a key could contain '#'
+      const hash = value.indexOf(" #");
+      if (hash !== -1) value = value.slice(0, hash).trim();
+    }
+
+    vars[key] = value;
+  }
+
+  return vars;
+}
+
+function loadEnvFile() {
+  const scriptDir = dirname(fileURLToPath(import.meta.url));
+
+  // Later entries win, so a project-local .env beats one next to the script
+  const candidates = [join(scriptDir, ".env"), join(process.cwd(), ".env")];
+  const loaded = [];
+
+  for (const path of candidates) {
+    if (!existsSync(path)) continue;
+    try {
+      const vars = parseEnvFile(readFileSync(path, "utf8"));
+      for (const [key, value] of Object.entries(vars)) {
+        // Never clobber a real environment variable
+        if (process.env[key] === undefined) process.env[key] = value;
+      }
+      loaded.push(path);
+    } catch {
+      // A malformed .env should never be the reason the tool won't start
+    }
+  }
+
+  return loaded;
+}
+
+const LOADED_ENV_FILES = loadEnvFile();
 
 // ============================================
 // CONFIGURATION
 // ============================================
 
-const CONFIG = {
-  provider: process.env.LLM_PROVIDER || "anthropic", // "anthropic" or "openai"
+/**
+ * Provider registry.
+ *
+ * `sdk` selects the client. "anthropic" uses the Anthropic SDK; "openai" uses the
+ * OpenAI SDK, which also drives OpenRouter and DeepSeek since both expose an
+ * OpenAI-compatible endpoint. Only the baseURL differs.
+ *
+ * `search` is the field that actually matters here:
+ *   "native" - server-side agentic search; the model searches repeatedly until satisfied.
+ *   "plugin" - OpenRouter's `web` plugin. Grounds each request with a fixed set of
+ *              results: one pass per request, not an agentic loop. Real search, but
+ *              thinner than native when checking many citations one at a time.
+ *   "none"   - no web access. Research quality drops and verification becomes
+ *              unsound; see the no-search prompt variants below.
+ */
+const PROVIDERS = {
   anthropic: {
-    apiKey: process.env.ANTHROPIC_API_KEY,
-    model: process.env.ANTHROPIC_MODEL || "claude-sonnet-5",
+    label: "Anthropic",
+    sdk: "anthropic",
+    apiKeyEnv: "ANTHROPIC_API_KEY",
+    modelEnv: "ANTHROPIC_MODEL",
+    defaultModel: "claude-sonnet-5",
+    search: "native",
   },
   openai: {
-    apiKey: process.env.OPENAI_API_KEY,
-    model: process.env.OPENAI_MODEL || "gpt-5.6-terra",
+    label: "OpenAI",
+    sdk: "openai",
+    apiKeyEnv: "OPENAI_API_KEY",
+    modelEnv: "OPENAI_MODEL",
+    defaultModel: "gpt-5.6-terra",
+    search: "native",
   },
+  openrouter: {
+    label: "OpenRouter",
+    sdk: "openai",
+    baseURL: "https://openrouter.ai/api/v1",
+    apiKeyEnv: "OPENROUTER_API_KEY",
+    modelEnv: "OPENROUTER_MODEL",
+    defaultModel: "anthropic/claude-sonnet-5",
+    search: "plugin",
+  },
+  deepseek: {
+    label: "DeepSeek",
+    sdk: "openai",
+    baseURL: "https://api.deepseek.com",
+    apiKeyEnv: "DEEPSEEK_API_KEY",
+    modelEnv: "DEEPSEEK_MODEL",
+    defaultModel: "deepseek-v4-pro",
+    search: "none",
+  },
+};
+
+const CONFIG = {
+  provider: process.env.LLM_PROVIDER || "anthropic",
   maxTokens: 16384,
   // Citation verification burns through searches faster than essay fact-checking did
   maxSearches: Number(process.env.MAX_SEARCHES) || 30,
   // Hard stop on the agentic loop so a misbehaving model can't bill indefinitely
   maxSearchTurns: Number(process.env.MAX_SEARCH_TURNS) || 40,
+  // Results per grounding pass for OpenRouter's web plugin
+  webPluginResults: Number(process.env.WEB_PLUGIN_RESULTS) || 5,
+  // Below this, an agent's output is almost certainly truncated or refused
+  minOutputChars: Number(process.env.MIN_OUTPUT_CHARS) || 2000,
 };
+
+/**
+ * Resolve the active provider: definition, model, and key.
+ * Fails with an actionable message instead of letting a vague 401 surface later.
+ */
+function resolveProvider(name = CONFIG.provider) {
+  const provider = PROVIDERS[name];
+  if (!provider) {
+    throw new Error(
+      `Unknown provider "${name}". Options: ${Object.keys(PROVIDERS).join(", ")}`
+    );
+  }
+
+  const apiKey = process.env[provider.apiKeyEnv];
+  if (!apiKey) {
+    throw new Error(
+      `Missing API key for ${provider.label}.\n  export ${provider.apiKeyEnv}="..."`
+    );
+  }
+
+  return {
+    name,
+    ...provider,
+    apiKey,
+    model: process.env[provider.modelEnv] || provider.defaultModel,
+  };
+}
+
+function providerSupportsSearch(name = CONFIG.provider) {
+  return (PROVIDERS[name]?.search ?? "none") !== "none";
+}
+
+const SEARCH_LABELS = {
+  native: "native (agentic, model searches until satisfied)",
+  plugin: "web plugin (one grounding pass per request)",
+  none: "NONE - citations cannot be verified",
+};
+
+/**
+ * Shown at startup on a provider without web access. Deliberately blunt: the
+ * failure it describes is invisible in the output, which is what makes it
+ * dangerous. The proposal gets a matching banner written into the file itself.
+ */
+const SEARCH_UNAVAILABLE_NOTICE = `
+${"!".repeat(60)}
+WARNING: ${"this provider has no web search"}
+
+Archive will research from training data only - possibly stale, and it
+cannot confirm any source exists.
+
+Critic CANNOT VERIFY CITATIONS on this run. It has been instructed not to
+use the word VERIFIED at all, because checking a citation against the same
+model that produced it proves nothing.
+
+Treat every source in the output as unconfirmed until a human checks it.
+For a run you intend to act on, use anthropic, openai, or openrouter.
+${"!".repeat(60)}`;
 
 // ============================================
 // AGENTS
@@ -96,11 +280,65 @@ Knows the difference between an image you can use and an image you merely found,
 /**
  * Every agent needs the course parameters, so build the brief once.
  */
+// Run context passed to every prompt builder. Defaults to the optimistic case so
+// tasks can still be built standalone (tests, tooling) without a live provider.
+const DEFAULT_CTX = { searchAvailable: true };
+
 const courseBrief = (inputs) => `COURSE BRIEF
 Subject: ${inputs.subject}
 Level: ${inputs.level}
 Length: ${inputs.weeks} weeks
 Format: ${inputs.format}`;
+
+/**
+ * Search-availability preamble for Archive.
+ * Without search it can still produce a useful survey from training data, but it
+ * must not present that as current or confirmed.
+ */
+const researchSearchNotice = (searchAvailable) =>
+  searchAvailable
+    ? `YOU HAVE ACCESS TO WEB SEARCH. Use it aggressively. Search repeatedly with different queries.
+Look specifically for real course syllabi, university catalog listings, review articles,
+recent scholarship, and professional or accreditation standards where they apply.`
+    : `YOU HAVE NO WEB ACCESS ON THIS RUN. Everything you write comes from training data,
+which means it may be outdated and you cannot confirm that any source exists as you describe it.
+
+Work within that limit honestly:
+- Prefer works you are highly confident about - widely taught, frequently cited, long in print.
+- Mark every citation [UNVERIFIED]. You have no way to check any of them.
+- Say plainly when your knowledge of recent work is likely to be stale.
+- Do not manufacture specificity. A half-remembered page number or ISBN is worse than none.
+- Where you would normally search, note what an instructor should look up themselves.`;
+
+/**
+ * Search-availability preamble for Critic.
+ *
+ * This is the load-bearing one. Verification without search is not verification -
+ * the model would be checking citations against the same memory that produced
+ * them. So the status vocabulary changes: VERIFIED is removed entirely, because
+ * nothing on this run can earn it.
+ */
+const verifySearchNotice = (searchAvailable) =>
+  searchAvailable
+    ? `YOU HAVE ACCESS TO WEB SEARCH. Use it heavily. Your primary job is catching citations that
+do not exist, and you cannot do that from memory.`
+    : `YOU HAVE NO WEB ACCESS ON THIS RUN, which places a hard limit on what you can honestly claim.
+
+You cannot confirm that any cited work exists. Checking a citation against your own memory is
+not verification - that memory is what generated the citation in the first place, so agreement
+proves nothing. A confident VERIFIED here would be actively harmful: it would launder an
+unchecked reading list into one that looks audited.
+
+Therefore, on this run:
+- The label VERIFIED is unavailable to you. Do not use it under any circumstance.
+- Use only: PLAUSIBLE (consistent with what you know, still unchecked),
+  SUSPECT (something is off - wrong era, wrong author, oddly specific, too convenient),
+  or UNCHECKABLE (you have no useful knowledge of this work).
+- Open your report by stating that no citation in it has been externally verified.
+- Rank the citations by how urgently a human should check them, riskiest first.
+
+Everything that does not depend on external lookup - outcome alignment, workload arithmetic,
+internal sequencing, rubric clarity, coverage - you can still assess rigorously. Do that fully.`;
 
 /**
  * Repeated in every prompt that touches a citation. Fabricated sources are
@@ -117,13 +355,11 @@ const tasks = [
     id: "research",
     agent: "archive",
     useWebSearch: true, // Enable web search for this task
-    description: (inputs) => `${courseBrief(inputs)}
+    description: (inputs, results, ctx = DEFAULT_CTX) => `${courseBrief(inputs)}
 
 Survey the field so a course can be built on top of your findings.
 
-YOU HAVE ACCESS TO WEB SEARCH. Use it aggressively. Search repeatedly with different queries.
-Look specifically for real course syllabi, university catalog listings, review articles,
-recent scholarship, and professional or accreditation standards where they apply.
+${researchSearchNotice(ctx.searchAvailable)}
 
 ${CITATION_RULE}
 
@@ -313,10 +549,9 @@ low-stakes weekly work, final project spec with milestones, workload audit, and 
     id: "verify",
     agent: "critic",
     useWebSearch: true, // Enable web search for citation verification
-    description: (inputs, results) => `${courseBrief(inputs)}
+    description: (inputs, results, ctx = DEFAULT_CTX) => `${courseBrief(inputs)}
 
-YOU HAVE ACCESS TO WEB SEARCH. Use it heavily. Your primary job is catching citations that
-do not exist, and you cannot do that from memory.
+${verifySearchNotice(ctx.searchAvailable)}
 
 Course outline:
 
@@ -334,14 +569,22 @@ Review this course the way a curriculum committee would, but do the citation wor
 never has time for.
 
 ## 1. CITATION VERIFICATION
-Go through EVERY cited work in the outline and materials. Search for each one.
+Go through EVERY cited work in the outline and materials.
 Present results as a table with columns: Cited As | Status | Correction / Notes
 
-Use exactly these status values:
+${
+  ctx.searchAvailable
+    ? `Search for each one. Use exactly these status values:
 - VERIFIED - exists as cited
 - CORRECTED - exists, but a detail was wrong (give the corrected citation in full)
 - UNVERIFIABLE - could not confirm either way (say what you searched)
-- LIKELY FABRICATED - strong evidence this work does not exist
+- LIKELY FABRICATED - strong evidence this work does not exist`
+    : `You have no search access, so use exactly these status values:
+- PLAUSIBLE - consistent with what you know, but UNCHECKED
+- SUSPECT - something is wrong or suspiciously convenient about this citation
+- UNCHECKABLE - you have no useful knowledge of this work
+Do not use VERIFIED. Nothing on this run has been verified.`
+}
 
 Do not skim this section. A single invented book in a reading list discredits the entire proposal.
 List every fabrication and every correction again in a consolidated block at the end of this
@@ -455,12 +698,217 @@ screening list, object-based learning opportunities, and accessibility notes.`,
 // LLM CLIENT
 // ============================================
 
-function createClient() {
-  if (CONFIG.provider === "anthropic") {
-    return new Anthropic({ apiKey: CONFIG.anthropic.apiKey });
-  } else {
-    return new OpenAI({ apiKey: CONFIG.openai.apiKey });
+function createClient(provider = resolveProvider()) {
+  if (provider.sdk === "anthropic") {
+    return new Anthropic({ apiKey: provider.apiKey });
   }
+
+  // OpenAI, OpenRouter, and DeepSeek all speak the OpenAI protocol
+  return new OpenAI({
+    apiKey: provider.apiKey,
+    ...(provider.baseURL ? { baseURL: provider.baseURL } : {}),
+    ...(provider.name === "openrouter"
+      ? {
+          defaultHeaders: {
+            "HTTP-Referer": "https://github.com/otisworks/curriculum-squad",
+            "X-Title": "curriculum-squad",
+          },
+        }
+      : {}),
+  });
+}
+
+/**
+ * A response that stopped early is not a result, it's a fragment - and a fragment
+ * of a reading list is worse than none, because every downstream agent treats it
+ * as complete. Detect it, mark it retryable, and describe it in plain language.
+ */
+function assertComplete(agent, text, stopReason) {
+  const truncated =
+    stopReason === "max_tokens" ||
+    stopReason === "length" ||
+    stopReason === "incomplete";
+
+  if (truncated) {
+    const error = new Error(
+      `${agent.name} ran out of room and its answer was cut off mid-sentence.`
+    );
+    error.retryable = true;
+    error.guidance =
+      `This usually means the course is too big to describe in one response.\n` +
+      `Try asking for a shorter course, for example --weeks=10.`;
+    throw error;
+  }
+
+  const length = text ? text.trim().length : 0;
+  if (length < CONFIG.minOutputChars) {
+    const error = new Error(
+      `${agent.name} stopped early, returning only ${length} characters where a ` +
+        `complete answer runs to several thousand.`
+    );
+    error.retryable = true;
+    error.guidance =
+      `This is usually a temporary hiccup from the AI provider rather than a\n` +
+      `problem with your subject. Running the same command again often works.`;
+    throw error;
+  }
+
+  return text;
+}
+
+// ============================================
+// ERROR TRANSLATION
+// ============================================
+
+/**
+ * Turn provider errors into something a curriculum designer can act on.
+ *
+ * The people using this are not going to read a raw 401 JSON body and conclude
+ * that their API key has a stray space in it. Each case returns what happened
+ * and what to do about it; --debug still shows the original.
+ */
+function explainError(error, provider) {
+  const status = error?.status ?? error?.response?.status;
+  const raw = `${error?.message ?? error}`;
+  const keyEnv = provider?.apiKeyEnv ?? "your API key";
+  const modelEnv = provider?.modelEnv ?? "the model variable";
+  const label = provider?.label ?? "the AI provider";
+
+  // Our own errors already speak human and carry their own guidance
+  if (error?.guidance) {
+    return { headline: raw, guidance: error.guidance, retryable: !!error.retryable };
+  }
+
+  if (status === 401 || status === 403 || /authentication|invalid.*api.?key|unauthorized/i.test(raw)) {
+    return {
+      headline: `${label} rejected your API key.`,
+      guidance:
+        `Check that ${keyEnv} is set correctly.\n` +
+        `Common causes: a missing character from copy/paste, an extra space,\n` +
+        `a key for a different provider, or a key that has been revoked.\n\n` +
+        `You can put it in a file named .env next to this script:\n` +
+        `  ${keyEnv}=your-key-here`,
+      retryable: false,
+    };
+  }
+
+  if (status === 404 || /model.*(not found|does not exist)|unknown model/i.test(raw)) {
+    return {
+      headline: `${label} doesn't recognise the model "${provider?.model}".`,
+      guidance:
+        `The model name may have changed or may not be available on your account.\n` +
+        `Set a different one with ${modelEnv}, or unset it to use the default.`,
+      retryable: false,
+    };
+  }
+
+  if (status === 429 || /rate.?limit|too many requests/i.test(raw)) {
+    return {
+      headline: `${label} is rate limiting this account.`,
+      guidance:
+        `You've sent requests faster than your plan allows, or hit a usage cap.\n` +
+        `Waiting a few minutes and running the same command again usually works.`,
+      retryable: true,
+    };
+  }
+
+  if (/insufficient|quota|billing|credit|payment/i.test(raw)) {
+    return {
+      headline: `${label} reports a billing or credit problem.`,
+      guidance:
+        `The account behind this API key may be out of credit.\n` +
+        `Check the billing page for ${label} and top up if needed.`,
+      retryable: false,
+    };
+  }
+
+  if (/context length|too long|maximum.*tokens|prompt is too long/i.test(raw)) {
+    return {
+      headline: `The request grew too large for ${label} to handle.`,
+      guidance:
+        `Earlier steps produced more material than the model can read back in.\n` +
+        `Try a shorter course, for example --weeks=10.`,
+      retryable: false,
+    };
+  }
+
+  if (status >= 500 || /overloaded|server error|service unavailable|timeout|ETIMEDOUT/i.test(raw)) {
+    return {
+      headline: `${label} is having trouble on their end.`,
+      guidance:
+        `This is a temporary problem with the provider, not with your setup.\n` +
+        `Waiting a few minutes and running the same command again usually works.`,
+      retryable: true,
+    };
+  }
+
+  if (/ENOTFOUND|ECONNREFUSED|ECONNRESET|fetch failed|network/i.test(raw)) {
+    return {
+      headline: `Couldn't reach ${label}.`,
+      guidance:
+        `This looks like a network problem. Check your internet connection.\n` +
+        `If you're on a work network, a firewall may be blocking the connection -\n` +
+        `that's one your IT team can help with.`,
+      retryable: true,
+    };
+  }
+
+  return {
+    headline: `Something went wrong while talking to ${label}.`,
+    guidance:
+      `The error was: ${raw}\n\n` +
+      `Run the same command with --debug to see the full technical details.`,
+    retryable: false,
+  };
+}
+
+/**
+ * Print a failure the way a non-technical user needs to see it.
+ */
+function reportError(error, provider, debug = false) {
+  const { headline, guidance } = explainError(error, provider);
+
+  console.error(`\n${"-".repeat(60)}`);
+  console.error(`STOPPED: ${headline}`);
+  console.error(`${"-".repeat(60)}\n`);
+  if (guidance) console.error(`${guidance}\n`);
+
+  if (debug) {
+    console.error(`${"-".repeat(60)}`);
+    console.error("Technical detail (--debug):");
+    console.error(error?.stack ?? error);
+    console.error(`${"-".repeat(60)}\n`);
+  }
+}
+
+/**
+ * Run a step, retrying once if the failure looks transient.
+ *
+ * A run is many minutes of API time and real money. Dying on a hiccup that a
+ * single retry would have absorbed is the worst possible outcome for someone
+ * who has been watching a terminal for a quarter of an hour.
+ */
+async function withRetry(fn, { provider, verbose = true, attempts = 2, delayMs = 3000 } = {}) {
+  let lastError;
+
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      return await fn(attempt);
+    } catch (error) {
+      lastError = error;
+      const { headline, retryable } = explainError(error, provider);
+
+      if (!retryable || attempt === attempts) break;
+
+      if (verbose) {
+        console.log(`\n  ${headline}`);
+        console.log(`  Trying that step once more in ${delayMs / 1000}s...\n`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+
+  throw lastError;
 }
 
 /**
@@ -486,12 +934,12 @@ Search multiple times with different queries to get comprehensive results.`;
 /**
  * Call LLM without tools (simple completion)
  */
-async function callLLMSimple(client, agent, prompt) {
+async function callLLMSimple(client, agent, prompt, provider = resolveProvider()) {
   const systemPrompt = buildSystemPrompt(agent);
 
-  if (CONFIG.provider === "anthropic") {
+  if (provider.sdk === "anthropic") {
     const response = await client.messages.create({
-      model: CONFIG.anthropic.model,
+      model: provider.model,
       max_tokens: CONFIG.maxTokens,
       system: systemPrompt,
       messages: [{ role: "user", content: prompt }],
@@ -501,17 +949,25 @@ async function callLLMSimple(client, agent, prompt) {
     if (textBlocks.length === 0) {
       throw new Error(`No text in response. Got: ${JSON.stringify(response.content.map(b => b.type))}`);
     }
-    return textBlocks.map((b) => b.text).join("\n");
+    return assertComplete(
+      agent,
+      textBlocks.map((b) => b.text).join("\n"),
+      response.stop_reason
+    );
   } else {
     const response = await client.chat.completions.create({
-      model: CONFIG.openai.model,
+      model: provider.model,
       max_completion_tokens: CONFIG.maxTokens,
       messages: [
         { role: "system", content: systemPrompt },
         { role: "user", content: prompt },
       ],
     });
-    return response.choices[0].message.content;
+    return assertComplete(
+      agent,
+      response.choices[0].message.content,
+      response.choices[0].finish_reason
+    );
   }
 }
 
@@ -519,7 +975,7 @@ async function callLLMSimple(client, agent, prompt) {
  * Call Anthropic with web search capability
  * Uses an agentic loop to handle tool calls
  */
-async function callAnthropicWithSearch(client, agent, prompt, verbose = true) {
+async function callAnthropicWithSearch(client, agent, prompt, verbose = true, provider = resolveProvider()) {
   const systemPrompt = buildSystemPrompt(agent, true);
 
   // Anthropic's server-side web search tool
@@ -541,7 +997,7 @@ async function callAnthropicWithSearch(client, agent, prompt, verbose = true) {
   while (turns < CONFIG.maxSearchTurns) {
     turns++;
     const response = await client.messages.create({
-      model: CONFIG.anthropic.model,
+      model: provider.model,
       max_tokens: CONFIG.maxTokens,
       system: systemPrompt,
       tools: tools,
@@ -554,7 +1010,11 @@ async function callAnthropicWithSearch(client, agent, prompt, verbose = true) {
       const textBlocks = response.content.filter(
         (block) => block.type === "text"
       );
-      return textBlocks.map((b) => b.text).join("\n");
+      return assertComplete(
+        agent,
+        textBlocks.map((b) => b.text).join("\n"),
+        response.stop_reason
+      );
     }
 
     // Process tool uses
@@ -567,7 +1027,11 @@ async function callAnthropicWithSearch(client, agent, prompt, verbose = true) {
       const textBlocks = response.content.filter(
         (block) => block.type === "text"
       );
-      return textBlocks.map((b) => b.text).join("\n");
+      return assertComplete(
+        agent,
+        textBlocks.map((b) => b.text).join("\n"),
+        response.stop_reason
+      );
     }
 
     // Add assistant's response to messages
@@ -601,7 +1065,7 @@ async function callAnthropicWithSearch(client, agent, prompt, verbose = true) {
  * Call OpenAI with web search capability
  * Uses the responses API with web_search tool
  */
-async function callOpenAIWithSearch(client, agent, prompt, verbose = true) {
+async function callOpenAIWithSearch(client, agent, prompt, verbose = true, provider = resolveProvider()) {
   const systemPrompt = buildSystemPrompt(agent, true);
 
   const fullPrompt = `${systemPrompt}\n\n${prompt}`;
@@ -611,34 +1075,87 @@ async function callOpenAIWithSearch(client, agent, prompt, verbose = true) {
   }
 
   const response = await client.responses.create({
-    model: CONFIG.openai.model,
+    model: provider.model,
     tools: [{ type: "web_search" }],
     input: fullPrompt,
   });
 
-  return response.output_text;
+  return assertComplete(agent, response.output_text, response.status);
+}
+
+/**
+ * Call OpenRouter with its `web` plugin.
+ *
+ * Unlike the native paths, this is not an agentic loop: OpenRouter runs a search
+ * and injects the results into the prompt before the model responds. The model
+ * cannot decide to search again after reading them. That's adequate for Archive's
+ * broad survey, but genuinely thinner for Critic, which ideally looks up each
+ * citation separately. Documented in the README rather than papered over.
+ */
+async function callOpenRouterWithSearch(client, agent, prompt, verbose = true, provider = resolveProvider()) {
+  const systemPrompt = buildSystemPrompt(agent, true);
+
+  if (verbose) {
+    console.log(
+      `  [Web plugin enabled via OpenRouter, max_results=${CONFIG.webPluginResults}]`
+    );
+  }
+
+  const response = await client.chat.completions.create({
+    model: provider.model,
+    max_completion_tokens: CONFIG.maxTokens,
+    messages: [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: prompt },
+    ],
+    // OpenRouter-specific: model-agnostic grounding, native where available and
+    // Exa-backed otherwise. Passed through by the OpenAI SDK untouched.
+    plugins: [{ id: "web", max_results: CONFIG.webPluginResults }],
+  });
+
+  const choice = response.choices[0];
+
+  // Surface the sources the plugin actually used, so a reader can audit them
+  const annotations = choice.message?.annotations ?? [];
+  const citations = annotations
+    .filter((a) => a.type === "url_citation")
+    .map((a) => `- ${a.url_citation.title}: ${a.url_citation.url}`);
+
+  if (verbose && citations.length) {
+    console.log(`  [${citations.length} sources returned by web plugin]`);
+  }
+
+  const text = assertComplete(agent, choice.message.content, choice.finish_reason);
+
+  return citations.length
+    ? `${text}\n\n---\n\n## Sources retrieved by web search\n\n${citations.join("\n")}`
+    : text;
 }
 
 /**
  * Call LLM with web search capability
- * Routes to appropriate provider implementation
+ * Routes to the appropriate implementation for the provider's search style
  */
-async function callLLMWithSearch(client, agent, prompt, verbose = true) {
-  if (CONFIG.provider === "anthropic") {
-    return callAnthropicWithSearch(client, agent, prompt, verbose);
-  } else {
-    return callOpenAIWithSearch(client, agent, prompt, verbose);
+async function callLLMWithSearch(client, agent, prompt, verbose = true, provider = resolveProvider()) {
+  if (provider.search === "plugin") {
+    return callOpenRouterWithSearch(client, agent, prompt, verbose, provider);
   }
+  if (provider.sdk === "anthropic") {
+    return callAnthropicWithSearch(client, agent, prompt, verbose, provider);
+  }
+  return callOpenAIWithSearch(client, agent, prompt, verbose, provider);
 }
 
 /**
  * Main LLM call function - routes to appropriate handler
  */
-async function callLLM(client, agent, prompt, useWebSearch = false, verbose = true) {
-  if (useWebSearch) {
-    return callLLMWithSearch(client, agent, prompt, verbose);
+async function callLLM(client, agent, prompt, useWebSearch = false, verbose = true, provider = resolveProvider()) {
+  // A task wanting search on a provider without it falls back to a plain call.
+  // The prompt has already been swapped for its no-search variant by this point.
+  if (useWebSearch && provider.search !== "none") {
+    return callLLMWithSearch(client, agent, prompt, verbose, provider);
   }
-  return callLLMSimple(client, agent, prompt);
+  return callLLMSimple(client, agent, prompt, provider);
 }
 
 // ============================================
@@ -668,23 +1185,54 @@ Options:
   --weeks=<n>        Course length in weeks, 1-52 (default: ${DEFAULTS.weeks})
   --format=<format>  seminar | lecture | studio | lab | workshop | online, or free text
                      (default: ${DEFAULTS.format})
+  --provider=<name>  ${Object.keys(PROVIDERS).join(" | ")}
+                     (default: ${CONFIG.provider}, or set LLM_PROVIDER)
   --no-visuals       Skip the Palette agent
+  --debug            Show full technical detail if something fails
   -h, --help         Show this message
+
+Tip: put quotes around a subject with spaces.
+  node curriculum-squad.js "History of Cartography"
+
+API keys: set the variable for your provider below, either with "export" or by
+saving it in a file named .env next to this script, e.g.
+  ANTHROPIC_API_KEY=sk-ant-...
+
+Providers:
+${Object.entries(PROVIDERS)
+  .map(
+    ([name, p]) =>
+      `  ${name.padEnd(11)} ${p.apiKeyEnv.padEnd(19)} search: ${
+        p.search === "none" ? "NONE - cannot verify citations" : p.search
+      }`
+  )
+  .join("\n")}
+
+  DeepSeek has no web search API. Research and verification both degrade;
+  Critic is blocked from claiming anything is VERIFIED. Fine for cheap drafts,
+  not for a proposal you intend to submit.
 
 Examples:
   node curriculum-squad.js "Media Archaeology"
   node curriculum-squad.js "Mycology for Artists" --level=grad --weeks=10 --format=studio
-  node curriculum-squad.js "Data Ethics" --weeks=12 --no-visuals`;
+  node curriculum-squad.js "Data Ethics" --provider=openrouter --weeks=12
+  node curriculum-squad.js "Cheap Draft" --provider=deepseek --no-visuals`;
 
 function parseArgs(args) {
   const flags = {
     noVisuals: false, // --no-visuals: skip palette
     help: false,
+    debug: false,
     subject: null,
     level: DEFAULTS.level,
     weeks: DEFAULTS.weeks,
     format: DEFAULTS.format,
+    provider: null, // null = fall back to LLM_PROVIDER / default
   };
+
+  // Collected rather than overwritten: an unquoted subject arrives as several
+  // arguments, and silently keeping only the last one produced the wrong course.
+  const subjectWords = [];
 
   // Accepts both --key=value and --key value
   const readValue = (arg, i) => {
@@ -701,6 +1249,8 @@ function parseArgs(args) {
       flags.noVisuals = true;
     } else if (arg === "-h" || arg === "--help") {
       flags.help = true;
+    } else if (arg === "--debug") {
+      flags.debug = true;
     } else if (key === "--level") {
       const { value, next } = readValue(arg, i);
       if (!value) throw new Error("--level requires a value");
@@ -719,11 +1269,27 @@ function parseArgs(args) {
       }
       flags.weeks = weeks;
       i = next;
+    } else if (key === "--provider") {
+      const { value, next } = readValue(arg, i);
+      if (!PROVIDERS[value]) {
+        throw new Error(
+          `Unknown provider "${value}". Options: ${Object.keys(PROVIDERS).join(", ")}`
+        );
+      }
+      flags.provider = value;
+      i = next;
     } else if (arg.startsWith("-")) {
       throw new Error(`Unknown option: ${arg}`);
     } else {
-      flags.subject = arg;
+      subjectWords.push(arg);
     }
+  }
+
+  if (subjectWords.length) {
+    flags.subject = subjectWords.join(" ");
+    // True when quotes were forgotten - main() echoes the subject back so a
+    // misread is caught in the first second rather than after a paid run
+    flags.subjectWasUnquoted = subjectWords.length > 1;
   }
 
   return flags;
@@ -735,8 +1301,12 @@ function parseArgs(args) {
 
 async function runTeam(inputs, options = {}) {
   const { verbose = true, onTaskStart, onTaskComplete, skipVisuals = false } = options;
-  const client = createClient();
+  const provider = resolveProvider();
+  const client = createClient(provider);
   const results = {};
+
+  // Passed to every prompt builder so agents know what they can honestly claim
+  const ctx = { searchAvailable: provider.search !== "none" };
 
   // Determine which tasks to run
   const activeTasks = tasks.filter((task) => {
@@ -746,17 +1316,23 @@ async function runTeam(inputs, options = {}) {
 
   console.log(`\n${"=".repeat(60)}`);
   console.log(`CURRICULUM DESIGN TEAM`);
-  console.log(`Provider: ${CONFIG.provider.toUpperCase()}`);
+  console.log(`Provider: ${provider.label} (${provider.model})`);
+  console.log(`Search:   ${SEARCH_LABELS[provider.search]}`);
   console.log(`Subject: ${inputs.subject}`);
   console.log(`Level:   ${inputs.level}`);
   console.log(`Length:  ${inputs.weeks} weeks`);
   console.log(`Format:  ${inputs.format}`);
   if (skipVisuals) console.log(`Mode:    NO VISUALS (skipping palette)`);
-  console.log(`${"=".repeat(60)}\n`);
+  console.log(`${"=".repeat(60)}`);
+
+  if (!ctx.searchAvailable) {
+    console.log(SEARCH_UNAVAILABLE_NOTICE);
+  }
+  console.log();
 
   for (const [index, task] of activeTasks.entries()) {
     const agent = agents[task.agent];
-    const taskPrompt = task.description(inputs, results);
+    const taskPrompt = task.description(inputs, results, ctx);
 
     if (verbose) {
       console.log(`\n[${"=".repeat(20)}]`);
@@ -772,9 +1348,21 @@ async function runTeam(inputs, options = {}) {
     const startTime = Date.now();
     const useSearch = task.useWebSearch || false;
     if (useSearch && verbose) {
-      console.log(`Web search: ENABLED`);
+      console.log(
+        ctx.searchAvailable
+          ? `Web search: ENABLED (${provider.search})`
+          : `Web search: UNAVAILABLE on ${provider.label} - running degraded`
+      );
     }
-    const result = await callLLM(client, agent, taskPrompt, useSearch, verbose);
+    const result = await withRetry(
+      (attempt) => {
+        if (attempt > 1 && verbose) {
+          console.log(`Retry ${attempt - 1} of ${task.id}...`);
+        }
+        return callLLM(client, agent, taskPrompt, useSearch, verbose, provider);
+      },
+      { provider, verbose }
+    );
     const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
 
     results[task.id] = result;
@@ -813,11 +1401,17 @@ const OUTPUT_FILES = {
  * Stitch the agent outputs into one document you can hand to a committee.
  * No LLM call - just concatenation in reading order.
  */
-function buildProposal(inputs, results) {
+function buildProposal(inputs, results, ctx = DEFAULT_CTX) {
+  // The warning travels with the document. A console message scrolls away; this
+  // stays attached to the thing someone might actually forward to a colleague.
+  const provenance = ctx.searchAvailable
+    ? `> Assembled by an LLM pipeline. Review the verification report before circulating -\n> citations flagged UNVERIFIABLE or LIKELY FABRICATED still need a human check.`
+    : `> **NO SOURCES IN THIS DOCUMENT HAVE BEEN VERIFIED.**\n>\n> Generated on a provider without web search, so citations were produced and\n> "checked" by the same model. Every author, title, year, and ISBN below should\n> be treated as unconfirmed until a human looks it up. Do not circulate as-is.`;
+
   const sections = [
     `# Course Proposal: ${inputs.subject}`,
     `**Level:** ${inputs.level}  \n**Length:** ${inputs.weeks} weeks  \n**Format:** ${inputs.format}  \n**Generated:** ${new Date().toISOString().slice(0, 10)}`,
-    `> Assembled by an LLM pipeline. Review the verification report before circulating -\n> citations flagged UNVERIFIABLE or LIKELY FABRICATED still need a human check.`,
+    provenance,
     `---\n\n# Course Outline\n\n${results.outline}`,
     `---\n\n# Materials & Assessment\n\n${results.materials}`,
   ];
@@ -847,10 +1441,43 @@ async function main() {
     return;
   }
 
+  // --provider overrides LLM_PROVIDER for this run
+  if (flags.provider) {
+    CONFIG.provider = flags.provider;
+  }
+
+  // Fail on a bad provider or missing key now, not five minutes into a run
+  let provider;
+  try {
+    provider = resolveProvider();
+  } catch (error) {
+    console.error(`\n${"-".repeat(60)}`);
+    console.error(`STOPPED: ${error.message.split("\n")[0]}`);
+    console.error(`${"-".repeat(60)}\n`);
+    const env = PROVIDERS[CONFIG.provider]?.apiKeyEnv;
+    if (env) {
+      console.error(`Set it for this terminal:`);
+      console.error(`  export ${env}="your-key-here"\n`);
+      console.error(`Or save it permanently in a file named .env next to this script:`);
+      console.error(`  ${env}=your-key-here\n`);
+    } else {
+      console.error(`${error.message}\n`);
+    }
+    process.exit(1);
+  }
+
+  if (LOADED_ENV_FILES.length) {
+    console.log(`Loaded settings from ${LOADED_ENV_FILES.join(", ")}`);
+  }
+
   const subject = flags.subject || "The cultural history of maps and mapmaking";
   if (!flags.subject) {
     console.log(`No subject given, using default: "${subject}"`);
     console.log(`Run with --help to see options.\n`);
+  } else if (flags.subjectWasUnquoted) {
+    // Reading it back is the cheapest possible guard against a misparse
+    console.log(`Subject read as: "${subject}"`);
+    console.log(`(If that's not right, put quotes around it: "${subject}")\n`);
   }
 
   const inputs = {
@@ -880,33 +1507,41 @@ async function main() {
       onTaskComplete,
     });
 
+    const ctx = { searchAvailable: provider.search !== "none" };
+
     await fs.writeFile(
       `${outputDir}/course-proposal.md`,
-      buildProposal(inputs, results)
+      buildProposal(inputs, results, ctx)
     );
 
     console.log(`\nOutputs saved to: ${outputDir}/`);
     console.log(`Start with: ${outputDir}/course-proposal.md`);
     console.log(`Then read:  ${outputDir}/${OUTPUT_FILES.verify} (citation checks)`);
+
+    if (!ctx.searchAvailable) {
+      console.log(
+        `\nReminder: this ran on ${provider.label}, which has no web search.\n` +
+          `No citation in these files has been verified against anything.`
+      );
+    }
   } catch (error) {
-    console.error("\nError running team:", error.message);
+    reportError(error, provider, flags.debug);
 
     // Don't litter the cwd with an empty directory if we failed before any output
     const written = await fs.readdir(outputDir).catch(() => []);
     if (written.length === 0) {
       await fs.rmdir(outputDir).catch(() => {});
+      console.error(`Nothing was saved, so nothing was charged for beyond this attempt.\n`);
     } else {
-      console.error(`Partial results saved in: ${outputDir}/`);
-      console.error(`Completed steps: ${written.sort().join(", ")}`);
+      console.error(`The steps that finished were still saved here:`);
+      console.error(`  ${outputDir}/`);
+      console.error(`  (${written.sort().join(", ")})\n`);
     }
     process.exit(1);
   }
 }
 
 // Run only when executed directly, so importing this file doesn't kick off a run
-import { fileURLToPath } from "url";
-import { realpathSync } from "fs";
-
 const isDirectRun =
   process.argv[1] &&
   realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));
@@ -916,4 +1551,18 @@ if (isDirectRun) {
 }
 
 // Export for use as module
-export { agents, tasks, runTeam, parseArgs, buildProposal, CONFIG };
+export {
+  agents,
+  tasks,
+  runTeam,
+  parseArgs,
+  buildProposal,
+  resolveProvider,
+  providerSupportsSearch,
+  assertComplete,
+  explainError,
+  withRetry,
+  parseEnvFile,
+  CONFIG,
+  PROVIDERS,
+};
