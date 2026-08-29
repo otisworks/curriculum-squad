@@ -9,7 +9,8 @@ Give it a subject, get back a researched, source-verified course proposal: catal
 > and [Search quality](#search-quality-differs-and-it-matters-here) (the provider abstraction
 > and why search tiers aren't interchangeable), and [Customizing](#customizing) (extension
 > points). One file, two dependencies, ESM, Node 18+. Importable as a module — `runTeam()`,
-> `agents`, `tasks`, and `PROVIDERS` are all exported.
+> `agents`, `tasks`, and `PROVIDERS` are all exported. `npm test` runs 62 checks and makes
+> no API calls.
 
 ## The Pipeline
 

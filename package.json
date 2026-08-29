@@ -9,7 +9,8 @@
   },
   "scripts": {
     "start": "node curriculum-squad.js",
-    "run": "node curriculum-squad.js"
+    "run": "node curriculum-squad.js",
+    "test": "node test.mjs"
   },
   "keywords": [
     "ai",
