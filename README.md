@@ -39,24 +39,54 @@ Read that report before circulating anything. The pipeline reduces fabrication r
 
 ## Setup
 
+### Install from npm (recommended)
+
 ```bash
-npm install
-cp .env.example .env
+mkdir my-course && cd my-course
+npm install @otisworks/curriculum-squad
 ```
 
-Then open `.env` in any text editor and add your API key. It's read automatically on every run.
+This installs the package into `node_modules/`, not into your current directory — that's normal for any npm package. Use `npx` to run it:
+
+```bash
+npx curriculum-squad "History of Cartography"
+```
+
+Add your API key by creating a `.env` file in the same directory you ran `npm install` from (not inside `node_modules`):
 
 ```
 ANTHROPIC_API_KEY=sk-ant-your-key-here
 ```
 
-`.env` is gitignored, so the key stays on your machine. If you'd rather not use a file, `export ANTHROPIC_API_KEY="..."` in your terminal still works and takes precedence.
+It's read automatically on every run. If you'd rather not use a file, `export ANTHROPIC_API_KEY="..."` in your terminal still works and takes precedence.
+
+Prefer a permanent command instead of `npx` every time? Install globally:
+
+```bash
+npm install -g @otisworks/curriculum-squad
+curriculum-squad "History of Cartography"
+```
+
+### Install from source (for contributors)
+
+```bash
+git clone https://github.com/otisworks/curriculum-squad.git
+cd curriculum-squad
+npm install
+cp .env.example .env
+```
+
+Then open `.env` and add your API key as above. Run it directly with Node instead of `npx`:
+
+```bash
+node curriculum-squad.js "History of Cartography"
+```
 
 ### Subjects with spaces need quotes
 
 ```bash
-node curriculum-squad.js "History of Cartography"     # correct
-node curriculum-squad.js History of Cartography       # works; echoes back what it parsed
+npx curriculum-squad "History of Cartography"     # correct
+npx curriculum-squad History of Cartography       # works; echoes back what it parsed
 ```
 
 Unquoted arguments are joined into a single subject, and the result is echoed before the run starts. A misparse surfaces immediately rather than after a full pipeline.
@@ -71,8 +101,8 @@ Unquoted arguments are joined into a single subject, and the result is echoed be
 | `deepseek` | `DEEPSEEK_API_KEY` | `deepseek-v4-pro` | **None** |
 
 ```bash
-node curriculum-squad.js "Data Ethics" --provider=openrouter
-LLM_PROVIDER=deepseek node curriculum-squad.js "Data Ethics"
+npx curriculum-squad "Data Ethics" --provider=openrouter
+LLM_PROVIDER=deepseek npx curriculum-squad "Data Ethics"
 ```
 
 OpenRouter and DeepSeek are OpenAI-compatible endpoints, so they reuse the OpenAI SDK with a different `baseURL`. Override any default model with the matching `*_MODEL` variable (`OPENROUTER_MODEL`, `DEEPSEEK_MODEL`, etc.).
@@ -106,17 +136,19 @@ Critic still does everything that doesn't need the web: outcome alignment, workl
 
 ```bash
 # Bare subject, all defaults (15-week upper-division undergraduate seminar)
-node curriculum-squad.js "Media Archaeology"
+npx curriculum-squad "Media Archaeology"
 
 # Specify the course parameters
-node curriculum-squad.js "Mycology for Artists" --level=grad --weeks=10 --format=studio
+npx curriculum-squad "Mycology for Artists" --level=grad --weeks=10 --format=studio
 
 # Skip the visual/media plan
-node curriculum-squad.js "Data Ethics" --weeks=12 --no-visuals
+npx curriculum-squad "Data Ethics" --weeks=12 --no-visuals
 
 # Options
-node curriculum-squad.js --help
+npx curriculum-squad --help
 ```
+
+> Installed from source instead? Replace `npx curriculum-squad` with `node curriculum-squad.js` in any command above.
 
 ### Options
 
@@ -162,7 +194,7 @@ Praxis produces the longest output in the pipeline — a full reading list plus 
 The run therefore aborts rather than continuing on a fragment when a response stops for length or returns implausibly short. If you hit this repeatedly, request a shorter course:
 
 ```bash
-node curriculum-squad.js "your subject" --weeks=10
+npx curriculum-squad "your subject" --weeks=10
 ```
 
 The thresholds: `MIN_OUTPUT_CHARS` (default 2000) is the minimum accepted response length; `CONFIG.maxTokens` (16384) is the output ceiling sent to the provider.
@@ -172,8 +204,8 @@ The thresholds: `MIN_OUTPUT_CHARS` (default 2000) is the minimum accepted respon
 ### Switch models
 
 ```bash
-ANTHROPIC_MODEL=claude-opus-5 node curriculum-squad.js "Comparative Mythology"
-OPENROUTER_MODEL=google/gemini-2.5-pro node curriculum-squad.js "X" --provider=openrouter
+ANTHROPIC_MODEL=claude-opus-5 npx curriculum-squad "Comparative Mythology"
+OPENROUTER_MODEL=google/gemini-2.5-pro npx curriculum-squad "X" --provider=openrouter
 ```
 
 ### Environment variables

@@ -10,7 +10,7 @@
 import Anthropic from "@anthropic-ai/sdk";
 import OpenAI from "openai";
 import { readFileSync, existsSync, realpathSync } from "fs";
-import { dirname, join } from "path";
+import { basename, dirname, join } from "path";
 import { fileURLToPath } from "url";
 
 // ============================================
@@ -1177,7 +1177,15 @@ const LEVEL_ALIASES = {
   phd: "doctoral",
 };
 
-const USAGE = `Usage: node curriculum-squad.js "<subject>" [options]
+// Reflects how the tool was actually launched, so usage text is correct whether
+// it's run from a cloned repo (`node curriculum-squad.js`) or installed from npm
+// and run via `npx curriculum-squad` / a global install (`curriculum-squad`).
+const INVOKED_AS = (() => {
+  const script = basename(process.argv[1] || "curriculum-squad.js");
+  return script.endsWith(".js") ? `node ${script}` : script;
+})();
+
+const USAGE = `Usage: ${INVOKED_AS} "<subject>" [options]
 
 Options:
   --level=<level>    intro | undergrad | upper | grad | phd, or any free-text description
@@ -1192,10 +1200,10 @@ Options:
   -h, --help         Show this message
 
 Tip: put quotes around a subject with spaces.
-  node curriculum-squad.js "History of Cartography"
+  ${INVOKED_AS} "History of Cartography"
 
 API keys: set the variable for your provider below, either with "export" or by
-saving it in a file named .env next to this script, e.g.
+saving it in a file named .env in the directory you're running this from, e.g.
   ANTHROPIC_API_KEY=sk-ant-...
 
 Providers:
@@ -1213,10 +1221,10 @@ ${Object.entries(PROVIDERS)
   not for a proposal you intend to submit.
 
 Examples:
-  node curriculum-squad.js "Media Archaeology"
-  node curriculum-squad.js "Mycology for Artists" --level=grad --weeks=10 --format=studio
-  node curriculum-squad.js "Data Ethics" --provider=openrouter --weeks=12
-  node curriculum-squad.js "Cheap Draft" --provider=deepseek --no-visuals`;
+  ${INVOKED_AS} "Media Archaeology"
+  ${INVOKED_AS} "Mycology for Artists" --level=grad --weeks=10 --format=studio
+  ${INVOKED_AS} "Data Ethics" --provider=openrouter --weeks=12
+  ${INVOKED_AS} "Cheap Draft" --provider=deepseek --no-visuals`;
 
 function parseArgs(args) {
   const flags = {
